@@ -46,6 +46,7 @@ unrelated sibling tool) to do the same.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import hmac
 import json
@@ -60,13 +61,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 APP_NAME = "technocore-websub"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 
 TECHNOCORE_BASE = "https://technocore.chat"
 STATE_PATH = Path.home() / ".technocore-websub" / "subscriptions.json"
 HUB_HOST = "0.0.0.0"
 HUB_PORT = 8734
-HUB_SELF_URL = f"http://localhost:{HUB_PORT}/"  # override via --self-url for a public hub
+HUB_SELF_URL = f"http://localhost:{HUB_PORT}/"  # set --self-url to the public URL for a public hub
 
 DEFAULT_LEASE_SECONDS = 10 * 24 * 3600  # 10 days, WebSub's own commonly-used default
 MIN_LEASE_SECONDS = 3600  # refuse a lease shorter than an hour - not worth a poller thread
@@ -79,6 +80,7 @@ _lock = threading.Lock()
 _subscriptions: dict[str, list[dict]] = {}  # topic -> [{callback, secret, expires_at}]
 _pollers: dict[str, threading.Thread] = {}  # topic -> running poller thread
 _cursors: dict[str, int] = {}  # topic -> last_seq already delivered
+_delivery_failures: dict[tuple[str, str], int] = {}  # (topic, callback) -> consecutive failures
 
 
 # --------------------------------------------------------------------------- persistence
@@ -214,8 +216,28 @@ def notify(topic: str, last_seq: int) -> None:
         try:
             with urllib.request.urlopen(request, timeout=NOTIFY_TIMEOUT):
                 pass
-        except (urllib.error.URLError, OSError):
-            pass  # a missed ping costs one poll cycle to a subscriber's own cursor, not a retry storm
+        except (urllib.error.URLError, OSError) as exc:
+            # No retry: a missed ping costs one poll cycle to a subscriber's own cursor, not a
+            # retry storm. But count it, and log the first failure of a streak, so an operator
+            # can tell "quiet room" from "this subscriber's endpoint is gone".
+            _record_delivery(topic, sub["callback"], exc)
+        else:
+            _record_delivery(topic, sub["callback"], None)
+
+
+def _record_delivery(topic: str, callback: str, exc: Exception | None) -> None:
+    key = (topic, callback)
+    with _lock:
+        before = _delivery_failures.get(key, 0)
+        if exc is None:
+            _delivery_failures.pop(key, None)
+        else:
+            _delivery_failures[key] = before + 1
+    if exc is not None and before == 0:
+        print(f"notify failed: {callback} ({topic}): {exc} - further failures counted silently",
+              file=sys.stderr)
+    elif exc is None and before:
+        print(f"notify recovered: {callback} ({topic}) after {before} failed ping(s)", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------------- polling
@@ -247,6 +269,10 @@ def _poll_loop(topic: str) -> None:
         except (urllib.error.URLError, OSError, json.JSONDecodeError):
             time.sleep(2)  # transient hiccup - back off and retry, this loop is long-lived
             continue
+        # The cursor is the room's head (`last_seq`), deliberately NOT derived from the
+        # returned messages (e.g. `messages[0].seq`): GET /r/<room>?since=S returns the
+        # NEWEST `limit` messages, not the ones right after S, so such a cursor can skip.
+        # The hub only needs "did the room advance", and the head answers that exactly.
         last_seq = view.get("last_seq", since)
         if last_seq != since:
             since = last_seq
@@ -330,7 +356,24 @@ def _parse_lease(raw: str) -> int:
     return max(MIN_LEASE_SECONDS, min(MAX_LEASE_SECONDS, seconds))
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    global HUB_HOST, HUB_PORT, HUB_SELF_URL, TECHNOCORE_BASE
+    parser = argparse.ArgumentParser(prog=APP_NAME, description="A WebSub hub for technocore.chat rooms.")
+    parser.add_argument("--host", default=HUB_HOST, help=f"listen address (default {HUB_HOST})")
+    parser.add_argument("--port", type=int, default=HUB_PORT, help=f"listen port (default {HUB_PORT})")
+    parser.add_argument(
+        "--self-url",
+        help="this hub's public URL, advertised as rel=\"hub\" in every notification's Link "
+        "header (default http://localhost:<port>/ - set it for any non-local deployment)",
+    )
+    parser.add_argument("--base", default=TECHNOCORE_BASE, help=f"technocore instance (default {TECHNOCORE_BASE})")
+    args = parser.parse_args(argv)
+    HUB_HOST, HUB_PORT, TECHNOCORE_BASE = args.host, args.port, args.base.rstrip("/")
+    HUB_SELF_URL = args.self_url or f"http://localhost:{HUB_PORT}/"
+    if not args.self_url:
+        print(f"note: advertising {HUB_SELF_URL} as rel=\"hub\"; pass --self-url for a public hub",
+              file=sys.stderr)
+
     load_state()
     for topic, entries in list(_subscriptions.items()):
         if any(e["expires_at"] > time.time() for e in entries):

@@ -51,8 +51,22 @@ Standard library only — no dependencies to install.
 python3 hub.py
 ```
 
-Listens on `:8734`. Point `HUB_PORT` / `TECHNOCORE_BASE` (top of `hub.py`) at different values
-if you're running it against a different instance or want a different port.
+Listens on `:8734`. Options:
+
+| Flag | Default | |
+|---|---|---|
+| `--self-url` | `http://localhost:<port>/` | **Set this for any public deployment.** It's advertised as `rel="hub"` in every notification's `Link` header; left at the default, a public hub tells subscribers it lives at `localhost`. |
+| `--port` | `8734` | Listen port. |
+| `--host` | `0.0.0.0` | Listen address. |
+| `--base` | `https://technocore.chat` | The technocore instance whose rooms are valid topics. |
+
+```bash
+python3 hub.py --self-url https://hub.example.org/hub
+```
+
+A notification that can't be delivered isn't retried (the subscriber catches up from its own
+cursor on the next ping), but the first failure of a streak per subscriber is logged to stderr,
+as is recovery, so a dead callback is visible.
 
 ## Subscribe to a room
 
